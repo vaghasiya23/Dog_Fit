@@ -138,7 +138,7 @@ def save_x0_grid_DiT(
         model_kwargs["w"] = w
 
     model_fn = diffusion._wrap_model(model)
-    model_output = model_fn(x_t, t, **model_kwargs)
+    model_output = model_fn(x_t, t, **model_kwargs).float()
 
     # handle learned var case (split C and C)
     if diffusion.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
@@ -292,10 +292,10 @@ def our_training_losses(self, model, x_start, t, model_kwargs=None, noise=None, 
         model_output = model(x_t, t, **model_kwargs)
 
         if pretrained_model is not None and ema is not None and counter > late_start_iter:
-            # guidance DogFit
+            # guidance DogFit (computed in float32 to prevent mantissa cancellation)
             with torch.no_grad():
-                pretrained_output = pretrained_model(x_t, t, **pretrained_kwargs)
-                ema_output = ema(x_t, t, **ema_kwargs)
+                pretrained_output = pretrained_model(x_t, t, **pretrained_kwargs).float()
+                ema_output = ema(x_t, t, **ema_kwargs).float()
 
         if self.model_var_type in [
             ModelVarType.LEARNED,
@@ -368,7 +368,7 @@ def our_training_losses(self, model, x_start, t, model_kwargs=None, noise=None, 
             # -----------------------------------------
             # Save all images
             # -----------------------------------------
-            save_dir = f"DogFit_debug/{counter:06d}"
+            save_dir = f"/home/dse_413/DL_proj/temp/DogFit_debug/{counter:06d}"
             os.makedirs(save_dir, exist_ok=True)
 
             with torch.no_grad():
@@ -463,8 +463,8 @@ def our_training_losses_transport(
             y = model_kwargs["y"]
             # Disable label conditioning for pretrained model (use null class token)
             pretrained_kwargs = {"y": torch.full_like(y, 1000)}
-            pretrained_output = pretrained_model(xt, t, **pretrained_kwargs)
-            ema_output = ema(xt, t, **ema_kwargs)
+            pretrained_output = pretrained_model(xt, t, **pretrained_kwargs).float()
+            ema_output = ema(xt, t, **ema_kwargs).float()
 
         initial_ut = ut.clone().detach()
 
@@ -778,14 +778,17 @@ def load_exact_pretrained_model(model, pretrained_ckpt_path, image_size, tmp_dir
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
     """
-    Step the EMA model towards the current model.
+    Step the EMA model towards the current model. Handles CPU-GPU cross-device safely.
     """
     ema_params = OrderedDict(ema_model.named_parameters())
     model_params = OrderedDict(model.named_parameters())
 
     for name, param in model_params.items():
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+        if name in ema_params:
+            if ema_params[name].device != param.device:
+                ema_params[name].mul_(decay).add_(param.data.to(ema_params[name].device), alpha=1 - decay)
+            else:
+                ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
 def requires_grad(model, flag=True):
@@ -902,21 +905,31 @@ def main(args):
     pretrained_model = load_exact_pretrained_model(pretrained_model, args.pretrained_ckpt, args.image_size)  
     requires_grad(pretrained_model, False)
     pretrained_model.eval()
-    pretrained_model = pretrained_model.to(device)
+    if args.late_start_iter == 0:
+        pretrained_model = pretrained_model.to(device=device)
+    else:
+        logger.info(f"[DogFit] Keeping pretrained_model on CPU until step {args.late_start_iter} to save 2.5 GB VRAM.")
     
     # Guidance control:
     if args.guidance_control:
         logger.info("[DogFit] Using guided model wrapper with learnable guidance scale.")
-        model = GuidedWrapper(model, args.zero_norm_variance).to(device)
+        model = GuidedWrapper(model, args.zero_norm_variance)
     else:
         logger.info("[DogFit] Using standard model without guidance control.")
 
     # Note that parameter initialization is done within the DiT constructor
 
-    ema = deepcopy(model).to(device)
+    ema = deepcopy(model).to('cpu')
     requires_grad(ema, False)
+    ema.eval()
 
-    model = DDP(model.to(device), device_ids=[rank])
+    model = model.to(device)
+    if args.late_start_iter == 0:
+        ema = ema.to(device=device)
+    else:
+        logger.info(f"[DogFit] Keeping ema on CPU until step {args.late_start_iter} to save 2.5 GB VRAM.")
+
+    model = DDP(model, device_ids=[rank], gradient_as_bucket_view=True)
 
     if args.model in SiT_models:
         print("LOADING SIT MODEL!")
@@ -943,7 +956,8 @@ def main(args):
     logger.info("[DogFit] Patched diffusion training loss with Domain Guidance (w_DogFit={})".format(args.w_dog))
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    import bitsandbytes as bnb
+    opt = bnb.optim.AdamW8bit(model.parameters(), lr=1e-4, weight_decay=0)
 
     # Setup data:
     transform = transforms.Compose([
@@ -972,12 +986,21 @@ def main(args):
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    # update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    raw_model = model.module if isinstance(model, DDP) else model
+    update_ema(ema, raw_model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
     train_steps = 0
+    if args.resume_ckpt:
+        checkpoint = torch.load(args.resume_ckpt, map_location="cpu", weights_only=False)
+        raw_model.load_state_dict(checkpoint["model"])
+        ema.load_state_dict(checkpoint["ema"])
+        step_match = re.search(r"(\d+)\.pt", args.resume_ckpt)
+        if step_match:
+            train_steps = int(step_match.group(1))
+        logger.info(f"[DogFit] Resumed model & ema from {args.resume_ckpt} at step {train_steps}!")
     log_steps = 0
     running_loss = 0
     start_time = time()
@@ -999,11 +1022,14 @@ def main(args):
                 print(f"Batch y shape: {y.shape}, dtype: {y.dtype}, unique labels: {torch.unique(y)}")
                 print("=" * 20)
                 # Optionally visualize a few images
-                save_image(x[:8] * 0.5 + 0.5, f"tmp/sample_batch.png", nrow=4)
+                os.makedirs("/home/dse_413/DL_proj/temp/sample_batches", exist_ok=True)
+                save_image(x[:8] * 0.5 + 0.5, "/home/dse_413/DL_proj/temp/sample_batches/sample_batch.png", nrow=4)
 
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            if train_steps == 0:
+                torch.cuda.empty_cache()
             model_kwargs = dict(y=y)
 
             if args.guidance_control:
@@ -1018,6 +1044,16 @@ def main(args):
                 # print("[DogFit] control distribution:", args.control_distribution)
                 # print("[DogFit] Sampled w values:", w.flatten().cpu().numpy())
                 model_kwargs["w"] = w
+
+            if args.late_start_iter > 0 and train_steps >= args.late_start_iter:
+                if pretrained_model is not None and next(pretrained_model.parameters()).device != device:
+                    logger.info(f"[DogFit] Late start reached ({train_steps} >= {args.late_start_iter}). Moving pretrained_model to {device} in float32...")
+                    pretrained_model = pretrained_model.to(device=device)
+                    torch.cuda.empty_cache()
+                if ema is not None and next(ema.parameters()).device != device:
+                    logger.info(f"[DogFit] Moving ema to {device} in float32...")
+                    ema = ema.to(device=device)
+                    torch.cuda.empty_cache()
 
             if args.model in SiT_models:
                 loss_dict = transport.training_losses(
@@ -1057,8 +1093,10 @@ def main(args):
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            # update_ema(ema, model.module)
+            raw_model = model.module if isinstance(model, DDP) else model
+            update_ema(ema, raw_model)
 
             # Log loss values:
             running_loss += loss.item()
@@ -1083,10 +1121,10 @@ def main(args):
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
+                    raw_model = model.module if isinstance(model, DDP) else model
                     checkpoint = {
-                        #"model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        #"opt": opt.state_dict(),
+                        "model": raw_model.state_dict(),
+                        "ema": ema.state_dict() if (isinstance(ema, torch.nn.Module) and next(ema.parameters()).device == device) else raw_model.state_dict(),
                         "args": args
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
@@ -1097,12 +1135,14 @@ def main(args):
             # Generate x0 preview samples:
             if train_steps % args.log_every == 0 and rank == 0:
                 try:
+                    raw_model = model.module if isinstance(model, DDP) else model
+                    preview_model = ema if next(ema.parameters()).device == device else raw_model
                     if args.model in DiT_models:
                         print("Generating x0 preview with DiT...")
                         save_path = save_x0_grid_DiT(
                             step=train_steps,
                             out_dir=x0_preview_dir,
-                            model=ema,                       # prettier; use model.module if you want the raw net
+                            model=preview_model,                       # prettier; use model.module if you want the raw net
                             diffusion=diffusion,
                             vae=vae,
                             x_start_latents=x,               # current batch latents (already VAE-encoded above)
@@ -1175,6 +1215,7 @@ if __name__ == "__main__":
     parser.add_argument("--w-min", type=float, default=1.0, help="Maximum guidance scale") # DogFit
     parser.add_argument("--control-distribution", type=str, default="uniform") # DogFit
     parser.add_argument("--zero-norm-variance", type=str, default="111") # DogFit
+    parser.add_argument("--resume-ckpt", type=str, default=None, help="Path to checkpoint to resume training from")
     # For SiT transport models
     group = parser.add_argument_group("Transport arguments")
     group.add_argument("--path-type", type=str, default="Linear", choices=["Linear", "GVP", "VP"])

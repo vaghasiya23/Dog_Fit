@@ -10,6 +10,11 @@ DROPOUT_RATIO=0.1
 W_DOG=1.5
 W_CFG=1.5
 
+BATCH_SIZE=2
+SAMPLE_BATCH_SIZE=32
+EVAL_ONLY=0
+EVAL_STEP=""
+
 # Load all logic
 source scripts/config.sh
 
@@ -25,6 +30,10 @@ while [[ "$#" -gt 0 ]]; do
     --wdog) W_DOG="$2"; shift ;;
     --wcfg) W_CFG="$2"; shift ;;
     --model_name) MODEL="$2"; shift ;;
+    --batch_size) BATCH_SIZE="$2"; shift ;;
+    --sample_batch_size) SAMPLE_BATCH_SIZE="$2"; shift ;;
+    --eval_only) EVAL_ONLY=1 ;;
+    --eval_step) EVAL_STEP="$2"; shift ;;
     *) echo "Unknown parameter passed: $1"; exit 1 ;;
   esac
   shift
@@ -60,7 +69,7 @@ sample_CG1() {
         --model "$MODEL" --vae "$VAE" \
         --sample-dir "$GENERATED_DIR/$PADDED_STEP" \
         --ckpt "$CHECKPOINT_DIR/$PADDED_CKPT" \
-        --per-proc-batch-size "$BATCH_SIZE" --num-fid-samples "$NSAMPLE" \
+        --per-proc-batch-size "${SAMPLE_BATCH_SIZE:-32}" --num-fid-samples "$NSAMPLE" \
         --image-size "$IMAGE_SIZE" --num-classes "$NUM_CLASSES" \
         --cfg-scale 1 --num-sampling-steps "$NUM_SAMPLE_STEPS" \
         --dropout-ratio $DROPOUT_RATIO
@@ -84,7 +93,7 @@ sample_CG1_5() {
         --model "$MODEL" --vae "$VAE" \
         --sample-dir "$GENERATED_DIR/$PADDED_STEP" \
         --ckpt "$CHECKPOINT_DIR/$PADDED_CKPT" \
-        --per-proc-batch-size "$BATCH_SIZE" --num-fid-samples "$NSAMPLE" \
+        --per-proc-batch-size "${SAMPLE_BATCH_SIZE:-32}" --num-fid-samples "$NSAMPLE" \
         --image-size "$IMAGE_SIZE" --num-classes "$NUM_CLASSES" \
         --cfg-scale "$W_CFG" --num-sampling-steps "$NUM_SAMPLE_STEPS" \
         --dropout-ratio $DROPOUT_RATIO
@@ -108,7 +117,7 @@ sample_DoG1_5() {
         --model "$MODEL" --vae "$VAE" \
         --sample-dir "$GENERATED_DIR/$PADDED_STEP" \
         --ckpt "$CHECKPOINT_DIR/$PADDED_CKPT" \
-        --per-proc-batch-size "$BATCH_SIZE" --num-fid-samples "$NSAMPLE" \
+        --per-proc-batch-size "${SAMPLE_BATCH_SIZE:-32}" --num-fid-samples "$NSAMPLE" \
         --image-size "$IMAGE_SIZE" --num-classes "$NUM_CLASSES" \
         --cfg-scale "$W_DOG" --num-sampling-steps "$NUM_SAMPLE_STEPS" \
         --dropout-ratio $DROPOUT_RATIO
@@ -144,12 +153,23 @@ if [[ "$DATASET" == "ffhq256" ]]; then
     exit 0
 fi
 
-train_model
+if [[ "$EVAL_ONLY" -eq 0 ]]; then
+    train_model || { echo ">>> [ERROR] Training failed! Exiting."; exit 1; }
+fi
 
-for ((i=0; i<=TOTAL_STEPS; i+=CKPT_EVERY)); do
-    if [[ $i -eq 0 && "$SKIP_FIRST_CKPT" -eq 1 ]]; then
-        continue
-    fi
+if [[ -n "$EVAL_STEP" ]]; then
+    STEPS_TO_EVAL=("$EVAL_STEP")
+else
+    STEPS_TO_EVAL=()
+    for ((i=0; i<=TOTAL_STEPS; i+=CKPT_EVERY)); do
+        if [[ $i -eq 0 && "$SKIP_FIRST_CKPT" -eq 1 ]]; then
+            continue
+        fi
+        STEPS_TO_EVAL+=("$i")
+    done
+fi
+
+for i in "${STEPS_TO_EVAL[@]}"; do
     printf -v PADDED_CKPT "%07d.pt" "$i"
 
     printf -v PADDED_STEP "%07d_cg1" "$i"
@@ -167,8 +187,6 @@ for ((i=0; i<=TOTAL_STEPS; i+=CKPT_EVERY)); do
     printf -v PADDED_STEP "%07d_cg1_5" "$i"
     sample_CG1_5
     fid_CG1_5
-
-    
 done
 
 cleanup_dataset

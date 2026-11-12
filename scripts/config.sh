@@ -3,13 +3,15 @@
 # Global Constants
 TOTAL_STEPS=24000
 LOG_EVERY=1000
-CKPT_EVERY=24000
+CKPT_EVERY=2000
 SKIP_FIRST_CKPT=1
 
 IMAGE_SIZE=256
 MODEL="DiT-XL/2"
 
-BATCH_SIZE=32
+BATCH_SIZE=8
+BATCH_SIZE=4
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 VAE="ema"
 NUM_WORKERS=4
 CFG_SCALE=1.0
@@ -33,7 +35,7 @@ echo "Using MASTER_PORT=$PORT"
 # Set paths and dataset details
 resolve_dataset_config() {
   case "$DATASET" in
-    food-101_processed) NUM_CLASSES=101 ;;
+    food-101_processed|caltech-101_processed|caltech-101) NUM_CLASSES=101 ;;
     *) echo "Unknown dataset: $DATASET"; exit 1 ;;
   esac
   DATA_DIR_ZIP="$DATASETS_DIR/food-101.zip"
@@ -54,16 +56,40 @@ resolve_dataset_config() {
   RESULTS_FILE="$RESULTS_DIR/results"
 }
 
-# ==== PATHS ==== (These paths need to be changed)
+# ==== PATHS ====
 resolve_server_paths() {
     case "$SERVER" in
-        bool)
-            conda init
-            source ~/.bashrc
-            CODE_PRE_DIR="/path/to/main/directory"
-            DATASETS_DIR="$CODE_PRE_DIR/datasets" # "/path/to/datasets/" # Can keep this the way it is
-            RESULTS_PRE_DIR="$CODE_PRE_DIR/results" # "/path/to/results/directory" # Can keep this the way it is
-            ENV_PATH="path/to/python/environment" # Where you want the environment to be created 
+        bool|dse)
+            SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+            if [ -f "$SCRIPT_ROOT/train_DogFit.py" ]; then
+                CODE_PRE_DIR="$SCRIPT_ROOT"
+                if [ -d "$SCRIPT_ROOT/../../dl" ]; then
+                    ENV_PATH="$(cd "$SCRIPT_ROOT/../.." && pwd)/dl"
+                elif [ -d "/home/dse_413/DL_proj/dl" ]; then
+                    ENV_PATH="/home/dse_413/DL_proj/dl"
+                elif [ -d "$SCRIPT_ROOT/../dlom" ]; then
+                    ENV_PATH="$(cd "$SCRIPT_ROOT/.." && pwd)/dlom"
+                else
+                    ENV_PATH="/DATA/agniva/om/DL_proj/dlom"
+                fi
+            elif [ -d "/home/dse_413/DL_proj/dl" ]; then
+                CODE_PRE_DIR="/home/dse_413/DL_proj/Om/DogFit"
+                ENV_PATH="/home/dse_413/DL_proj/dl"
+            elif [ -d "/home/dse_413/DL_proj/Om" ]; then
+                CODE_PRE_DIR="/home/dse_413/DL_proj/Om/DogFit"
+                ENV_PATH="/home/dse_413/DL_proj/Om/dlom"
+            elif [ -d "/DATA/agniva/om/DL_proj" ]; then
+                CODE_PRE_DIR="/DATA/agniva/om/DL_proj/DogFit"
+                ENV_PATH="/DATA/agniva/om/DL_proj/dlom"
+            else
+                CODE_PRE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+                ENV_PATH="$(dirname "$CODE_PRE_DIR")/dlom"
+            fi
+            DATASETS_DIR="$CODE_PRE_DIR/datasets" # Can keep this the way it is
+            RESULTS_PRE_DIR="$CODE_PRE_DIR/results" # Can keep this the way it is
+            if [ -n "$CUDA_DEVICES" ]; then
+                NPROC_PER_NODE=$(awk -F',' '{print NF}' <<< "$CUDA_DEVICES")
+            fi
             ;;
         *)
             echo "Unknown server: $SERVER" >&2
@@ -75,73 +101,46 @@ resolve_server_paths() {
 create_environment() {
   echo ">>> Setting up environment..."
 
-  # Ensure conda is properly sourced
-  source "$(conda info --base)/etc/profile.d/conda.sh"
+  # Set TORCH_HOME to local torch_cache if available
+  if [ -d "$CODE_PRE_DIR/../torch_cache" ]; then
+    export TORCH_HOME="$(cd "$CODE_PRE_DIR/../torch_cache" && pwd)"
+    echo "Using offline TORCH_HOME=$TORCH_HOME"
+  elif [ -d "$CODE_PRE_DIR/torch_cache" ]; then
+    export TORCH_HOME="$(cd "$CODE_PRE_DIR/torch_cache" && pwd)"
+    echo "Using offline TORCH_HOME=$TORCH_HOME"
+  fi
 
-  if [ -d "$ENV_PATH" ]; then
-    echo "Using existing conda env at $ENV_PATH"
-    conda activate "$ENV_PATH"
-  else
-    echo "Creating new conda env at $ENV_PATH"
-    conda create --prefix "$ENV_PATH" python=3.11 -y
+  # 1. If an environment is already active, just use it!
+  if [ -n "$VIRTUAL_ENV" ]; then
+    echo "Using currently active environment: $VIRTUAL_ENV"
+  elif [ -f "$ENV_PATH/bin/activate" ]; then
+    echo "Activating environment from $ENV_PATH"
+    source "$ENV_PATH/bin/activate"
+  elif [ -f "$CODE_PRE_DIR/../dlom/bin/activate" ]; then
+    echo "Activating environment from $CODE_PRE_DIR/../dlom"
+    source "$CODE_PRE_DIR/../dlom/bin/activate"
+  elif [ -d "$ENV_PATH" ] && command -v conda &>/dev/null; then
     source "$(conda info --base)/etc/profile.d/conda.sh"
     conda activate "$ENV_PATH"
-    conda install pytorch torchvision pytorch-cuda=12.6 -c pytorch -c nvidia
-    pip install timm diffusers accelerate pytorch-fid torchdiffeq
+  else
+    echo "Using existing environment in PATH ($(which python))"
   fi
 
+  # Ensure dgm-eval is accessible
   if [ ! -d "dgm-eval" ]; then
-    git clone https://github.com/layer6ai-labs/dgm-eval.git
+    if [ -d "$CODE_PRE_DIR/../dgm-eval" ]; then
+      ln -s "$CODE_PRE_DIR/../dgm-eval" dgm-eval
+    fi
   fi
-  pushd dgm-eval
-  pip install -e .
-  popd
 }
 
 
 prepare_dataset() {
-
-  if [ "$DATASET" == 'food-101_processed' ]; then
-
-    if [ -d "$REAL_DATA_DIR" ] && [ "$(ls -A "$REAL_DATA_DIR")" ]; then
-      echo ">>> Dataset already exists at: $REAL_DATA_DIR. Skipping extraction."
-    else
-      echo ">>> Dataset not found at: $REAL_DATA_DIR. Extracting..."
-      if [ ! -f "$DATA_DIR_ZIP" ]; then
-        echo ">>> Dataset zip file not found: $DATA_DIR_ZIP. Downloading..."
-        if [ ! -d "$DATASETS_DIR" ]; then
-          mkdir -p "$DATASETS_DIR"
-        fi
-
-        curl -L -o "$DATA_DIR_ZIP" \
-          https://www.kaggle.com/api/v1/datasets/download/dansbecker/food-101 || {
-          echo "Failed to download dataset zip file."
-          exit 1
-        }
-      fi
-      echo ">>> Preparing dataset..."
-      TMP_DATASETS_DIR="${DATASETS_DIR}/tmp"
-      mkdir -p "$TMP_DATASETS_DIR"
-      unzip -qn "$DATA_DIR_ZIP" -d "$TMP_DATASETS_DIR"
-
-      # Move images/ from nested directory to $REAL_DATA_DIR
-      INNER_IMAGES_DIR="$TMP_DATASETS_DIR/food-101/food-101/images"
-      if [ -d "$INNER_IMAGES_DIR" ]; then
-        mkdir -p "$REAL_DATA_DIR"
-        mv "$INNER_IMAGES_DIR"/* "$REAL_DATA_DIR"/
-      else
-        echo "Expected path not found: $INNER_IMAGES_DIR"
-        exit 1
-      fi
-
-      # Clean up everything else
-      rm -rf "$TMP_DATASETS_DIR"
-    fi
-
-    find "$REAL_DATA_DIR" -name '._*' -delete
-    echo ">>> Dataset prepared at: $REAL_DATA_DIR"
+  if [ -d "$REAL_DATA_DIR" ] && [ "$(ls -A "$REAL_DATA_DIR" 2>/dev/null)" ]; then
+    echo ">>> Dataset found at: $REAL_DATA_DIR"
   else
-    echo "Unsupported dataset: $DATASET"
+    echo ">>> [ERROR] Dataset not found at: $REAL_DATA_DIR"
+    echo ">>> Please place or symlink the extracted images into: $REAL_DATA_DIR"
     exit 1
   fi
 }
@@ -151,4 +150,5 @@ log_and_run() {
     echo ">>> $1"
     shift
     "$@" 2>&1 | tee -a "$LOG_FILE"
+    return "${PIPESTATUS[0]}"
 }

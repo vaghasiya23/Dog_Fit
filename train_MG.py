@@ -425,7 +425,7 @@ def main(args):
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
+    model = DDP(model.to(device), device_ids=[rank], gradient_as_bucket_view=True)
 
     if args.model in SiT_models:
         transport = create_transport(
@@ -449,8 +449,9 @@ def main(args):
         vae = AutoencoderKL.from_pretrained(vae_path).to(device)
     logger.info("[MG CG] Patched diffusion training loss with Model Guidance (w_CG={})".format(args.w_cg))
 
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    # Setup optimizer with 8-bit AdamW to save VRAM:
+    import bitsandbytes as bnb
+    opt = bnb.optim.AdamW8bit(model.parameters(), lr=1e-4, weight_decay=0)
 
     # Setup data:
     transform = transforms.Compose([
@@ -544,6 +545,7 @@ def main(args):
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             update_ema(ema, model.module)
 

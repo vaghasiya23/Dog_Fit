@@ -241,16 +241,17 @@ def main(args):
             model_kwargs = dict(y=y)
             model_fn = model.forward
 
-        if args.model.startswith("SiT"):
-            samples = sample_fn(z, model_fn, **model_kwargs)[-1]
-        elif args.model.startswith("DiT"):
-            samples = diffusion.p_sample_loop(
-                model_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
-            )
-        if using_cfg:
-            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            if args.model.startswith("SiT"):
+                samples = sample_fn(z, model_fn, **model_kwargs)[-1]
+            elif args.model.startswith("DiT"):
+                samples = diffusion.p_sample_loop(
+                    model_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
+                )
+            if using_cfg:
+                samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
-        samples = vae.decode(samples / 0.18215).sample
+            samples = vae.decode(samples / 0.18215).sample
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
         # Save samples to disk as individual .png files

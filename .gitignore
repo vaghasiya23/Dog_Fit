@@ -1,11 +1,40 @@
-DogFit_debug/*
-datasets/*
-datasets/*
-datasets/*
-results/*
-logs/*
-pretrained_models/*
-tmp/*
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.bak
+
+# Checkpoints and large binaries
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.tar.gz
+*.tar
+*.zip
+*.whl
+*.npz
+
+# Model weights, datasets, outputs
+pretrained_models/
+datasets/
+results/
+logs/
+queue_logs/
+tmp/
+temp/
+DogFit_debug/
+CG_debug/
+test_samples/
+dgm-eval
+
+# Image outputs (allow presentation images)
 *.png
 *.jpg
 *.jpeg
+!presentation/images/*.png
+!presentation/images/*.jpg
+!presentation/images/*.jpeg
+
+# Environments
+dl/

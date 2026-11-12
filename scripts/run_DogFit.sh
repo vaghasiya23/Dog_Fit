@@ -1,4 +1,5 @@
 #!/bin/bash
+set -o pipefail
 
 # ====================== DEFAULT CONFIGURATION ======================
 
@@ -19,6 +20,10 @@ W_TRAIN_DOG=1.5
 DROPOUT_RATIO=0 
 CONTROL_DISTRIBUTION="uniform"
 ZERO_NORM_VARIANCE="011"
+SAMPLE_BATCH_SIZE=32
+EVAL_ONLY=0
+EVAL_STEP=""
+RESUME_CKPT=""
 
 # Load all logic
 source scripts/config.sh
@@ -40,6 +45,12 @@ while [[ "$#" -gt 0 ]]; do
     --w_min) W_MIN="$2"; shift ;;
     --sample_guidance) SAMPLE_GUIDANCE="$2"; shift ;;
     --control_distribution) CONTROL_DISTRIBUTION="$2"; shift ;;
+    --batch_size) BATCH_SIZE="$2"; shift ;;
+    --sample_batch_size) SAMPLE_BATCH_SIZE="$2"; shift ;;
+    --eval_only) EVAL_ONLY=1 ;;
+    --eval_step) EVAL_STEP="$2"; shift ;;
+    --nsample) NSAMPLE="$2"; shift ;;
+    --resume_ckpt) RESUME_CKPT="$2"; shift ;;
     --zero_norm_variance) ZERO_NORM_VARIANCE="$2"; shift ;;
 
     *) echo "Unknown parameter passed: $1"; exit 1 ;;
@@ -77,7 +88,8 @@ train_model() {
         --w-max "$W_MAX" \
         --w-min "$W_MIN" \
         --control-distribution "$CONTROL_DISTRIBUTION" \
-        --zero-norm-variance "$ZERO_NORM_VARIANCE" 
+        --zero-norm-variance "$ZERO_NORM_VARIANCE" \
+        ${RESUME_CKPT:+--resume-ckpt "$RESUME_CKPT"}
 }
 
 run_sampling() {
@@ -87,7 +99,7 @@ run_sampling() {
         --vae "$VAE" \
         --sample-dir "$GENERATED_DIR/$PADDED_STEP" \
         --ckpt "$CHECKPOINT_DIR/$PADDED_CKPT" \
-        --per-proc-batch-size "$BATCH_SIZE" \
+        --per-proc-batch-size "$SAMPLE_BATCH_SIZE" \
         --num-fid-samples "$NSAMPLE" \
         --image-size "$IMAGE_SIZE" \
         --num-classes "$NUM_CLASSES" \
@@ -123,41 +135,65 @@ calculate_fid() {
 
 # ====================== MAIN ======================
 echo ">>> Logging to: $LOG_FILE"
-rm -f "$LOG_FILE"
+if [[ "$EVAL_ONLY" -eq 0 ]]; then
+  rm -f "$LOG_FILE"
+fi
 mkdir -p "$(dirname "$LOG_FILE")" 
 
 create_environment
 prepare_dataset
 
-train_model
+if [[ "$EVAL_ONLY" -eq 0 ]]; then
+  train_model || { echo ">>> [ERROR] Training failed! Exiting."; exit 1; }
+fi
 
-for ((i=0; i<=TOTAL_STEPS; i+=CKPT_EVERY)); do
-  if [[ $i -eq 0 && "$SKIP_FIRST_CKPT" -eq 1 ]]; then
-    continue
-  fi
+if [[ -n "$EVAL_STEP" ]]; then
+  STEPS_TO_EVAL=("$EVAL_STEP")
+else
+  STEPS_TO_EVAL=()
+  for ((i=0; i<=TOTAL_STEPS; i+=CKPT_EVERY)); do
+    if [[ $i -eq 0 && "$SKIP_FIRST_CKPT" -eq 1 ]]; then
+      continue
+    fi
+    STEPS_TO_EVAL+=("$i")
+  done
+fi
+
+ORIG_RESULTS_FILE="$RESULTS_FILE"
+ORIG_GENERATED_DIR="$GENERATED_DIR"
+
+for i in "${STEPS_TO_EVAL[@]}"; do
   printf -v PADDED_STEP "%07d" "$i"
   printf -v PADDED_CKPT "%07d.pt" "$i"
+
+  RESULTS_BASE="$ORIG_RESULTS_FILE"
+  GENERATED_BASE="$ORIG_GENERATED_DIR"
 
   if (( $(echo "$GUIDANCE_CONTROL > 0" | bc -l) )); then
     if (( $(echo "$SAMPLE_GUIDANCE == 0" | bc -l) )); then
       GUIDANCE_VALUES=(1 1.5 2 3 4 5)
       for SG in "${GUIDANCE_VALUES[@]}"; do
         SAMPLE_GUIDANCE=$SG
-        RESULTS_FILE_ORIG="$RESULTS_FILE"
-        GENERATED_DIR_ORIG="$GENERATED_DIR"
-        RESULTS_FILE="${RESULTS_FILE_ORIG}_w_dgft${SAMPLE_GUIDANCE}"
-        GENERATED_DIR="${GENERATED_DIR_ORIG}_w_dgft${SAMPLE_GUIDANCE}"
+        RESULTS_FILE="${RESULTS_BASE}_w_dgft${SAMPLE_GUIDANCE}"
+        GENERATED_DIR="${GENERATED_BASE}_w_dgft${SAMPLE_GUIDANCE}"
+
+        if [[ -f "$RESULTS_FILE/fd_inception_${DATASET}-${PADDED_STEP}_nimage-${NSAMPLE}.txt" ]]; then
+          echo ">>> Results already exist for w_dgft${SAMPLE_GUIDANCE}, skipping..."
+          continue
+        fi
 
         run_sampling
         calculate_fid
       done
     else
-      RESULTS_FILE="${RESULTS_FILE}_w_dgft${SAMPLE_GUIDANCE}"
-      GENERATED_DIR="${GENERATED_DIR}_w_dgft${SAMPLE_GUIDANCE}"
+      RESULTS_FILE="${RESULTS_BASE}_w_dgft${SAMPLE_GUIDANCE}"
+      GENERATED_DIR="${GENERATED_BASE}_w_dgft${SAMPLE_GUIDANCE}"
       run_sampling
       calculate_fid
     fi
   else
+    RESULTS_FILE="$RESULTS_BASE"
+    GENERATED_DIR="$GENERATED_BASE"
     run_sampling
     calculate_fid
   fi
